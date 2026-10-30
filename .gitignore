@@ -7,3 +7,7 @@ eli/
 capture-out.jsonl
 prompt-too-long-fable.jsonl
 AGENTS.override.md
+
+# [epiq]: local hydrated state is never committed
+.epiq/events/
+.epiq/log/
