@@ -69,6 +69,8 @@ export class QueryContext {
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
+	/** Provider failure notice, never generated assistant content. */
+	turnSyntheticDiagnostic: string | undefined;
 	/** API message id from the last message_start, and whether its message_stop has
 	 *  arrived. An `assistant` message under a different id while the stream is still
 	 *  open is Claude Code's non-streaming fallback for a stalled stream. */
@@ -104,6 +106,7 @@ export class QueryContext {
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
+		this.turnSyntheticDiagnostic = undefined;
 		this.turnStreamMessageId = undefined;
 		this.turnStreamOpen = false;
 		this.turnStreamBlockStart = 0;

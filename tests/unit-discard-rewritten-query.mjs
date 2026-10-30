@@ -179,6 +179,59 @@ describe("discardRewrittenQuery", () => {
 			"its completion handler would otherwise capture the stale session id over the rebuilt one");
 	});
 
+	it("leaves the replacement turn untouched when a discarded SDK iterator throws late", async () => {
+		const { c, sdkQuery: controls } = parkedQuery();
+		const model = { api: "anthropic-messages", provider: "anthropic", id: "offline" };
+		let rejectOld;
+		let signalStarted;
+		const started = new Promise((resolve) => { signalStarted = resolve; });
+		const pending = new Promise((_, reject) => { rejectOld = reject; });
+		const oldQuery = Object.assign((async function* () {
+			signalStarted();
+			await pending;
+		})(), controls);
+		c.activeQuery = oldQuery;
+		const thrown = new Error("discarded SDK shutdown failed");
+		const oldCompletion = assert.rejects(
+			__test.consumeQuery(oldQuery, new Map(), model, () => false, c),
+			(error) => error === thrown,
+		);
+		await started;
+		discardRewrittenQuery(c);
+
+		// Fresh-query setup reuses the context while the discarded iterator is
+		// still unwinding. Deliver replacement output through real conversion.
+		c.resetTurnState(model);
+		const events = [];
+		const replacementStream = { push: (event) => events.push(event), end: () => events.push({ type: "end" }) };
+		c.currentPiStream = replacementStream;
+		async function* replacementQuery() {
+			yield { type: "assistant", message: { model: "claude", content: [{ type: "text", text: "Replacement answer" }] } };
+			yield { type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: 1786141800 } };
+			yield { type: "assistant", message: { model: "<synthetic>", content: [{ type: "text", text: "Replacement quota diagnostic" }] } };
+		}
+		const replacement = replacementQuery();
+		c.activeQuery = replacement;
+		await __test.consumeQuery(replacement, new Map(), model, () => false, c);
+		const before = structuredClone({
+			output: c.turnOutput, diagnostic: c.turnSyntheticDiagnostic,
+			rejection: c.rateLimitRejection, events,
+		});
+		assert.deepEqual(before.output.content, [{ type: "text", text: "Replacement answer" }]);
+		assert.equal(before.diagnostic, "Replacement quota diagnostic");
+		assert.equal(before.rejection.rateLimitType, "five_hour");
+
+		rejectOld(thrown);
+		await oldCompletion;
+
+		assert.deepEqual({
+			output: c.turnOutput, diagnostic: c.turnSyntheticDiagnostic,
+			rejection: c.rateLimitRejection, events,
+		}, before);
+		assert.equal(c.currentPiStream, replacementStream);
+		assert.equal(c.activeQuery, replacement);
+	});
+
 	it("consumes the mark for its pi session, leaving sibling sessions armed", () => {
 		const { c } = parkedQuery("call_1", "pi-b");
 		const other = parkedQuery("call_2", "pi-c");

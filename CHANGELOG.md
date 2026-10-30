@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- **Fix: preserve native fallback for synthetic usage-limit failures (VFWBHKT, #195)** — Keep failure notices in error metadata rather than generated assistant content or text events, preserving useful reset diagnostics even with empty terminal wording or SDK throws. Retain quota classification, genuine output/tool replay safety and abandoned-stream cleanup; native host settings still decide retry/fallback, with no credential-handling changes.
 - **Fix: same-process subagents preserve parent provider and conversation (TZPGET5)** — Replay source-owned provider registrations with the original serving function, including OMP child startup; scope session cleanup to its own conversation and retain parent ownership through child disposal. Genuine owner shutdown/reload still permits fresh activation; Claude Code credential handling is unchanged.
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
 - **Fix: queued steering keeps MCP input open through later turns (#172)** — Keep Claude Code's input open until each steer is replayed into a turn, then close after that turn completes. An error result still ends the query, so a steer Claude Code had queued can no longer run on and replace the failure. Thanks @Maverobot.

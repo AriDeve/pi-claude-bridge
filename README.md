@@ -137,6 +137,10 @@ Other extensions can change the system prompt. When the result still contains pi
 
 The bridge does not show plan usage itself. Claude Code sends a `rate_limit_event` when a usage window changes, and the bridge passes it to pi's `after_provider_response` event as `anthropic-ratelimit-unified-*` headers. Events are not tied to one response: one that arrives after a turn has ended on a tool call is reported on the next provider call, and only the latest is kept. The headers use the names that the Anthropic API uses (for example `anthropic-ratelimit-unified-5h-utilization`). The bridge sends only the headers that it can make from the event: the status, the reset time, the representative claim, the overage status and reset, and the utilization and reset of each window. The status code is always 200. An extension that reads these headers for the built-in `anthropic` provider can also accept `claude-bridge` without other changes.
 
+Claude Code's synthetic failure notices are error information, not generated assistant text: they appear in `errorMessage`, never assistant content or text-stream events. Meaningful terminal wording leads, with distinct provider diagnostics retained (including reset information); an empty terminal error uses the provider diagnostic instead. Rejected usage windows retain the quota/rate-limit label used by retry and fallback consumers. Genuine assistant output and dispatched tool calls remain intact; only abandoned partial streams receive the existing cleanup.
+
+On OMP, a pre-output rejection can therefore follow native `retry.fallbackChains` / `retry.fallbackOn` settings. The bridge does not enable fallback, invent candidates, or bypass replay safety after real output or tool activity. Recovery depends on the host mode and policy: main/JSON, buffered-text and subagent behavior need not be identical. Claude Code/SDK continues to own credentials and refresh.
+
 ### Using claude bridge with @gotgenes/pi-subagents
 
 Requires the following in `~/.pi/agent/subagents.json`:

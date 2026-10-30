@@ -27,6 +27,11 @@ function makeCtx() {
 	return c;
 }
 
+const diagnostic = "You've hit your session limit · resets 6:30pm (America/New_York)";
+const syntheticReport = {
+	type: "assistant", message: { model: "<synthetic>", content: [{ type: "text", text: diagnostic }] },
+};
+
 async function consume(c, messages) {
 	async function* gen() { for (const m of messages) yield m; }
 	await __test.consumeQuery(gen(), toolMap, fakeModel, () => false, c);
@@ -108,6 +113,111 @@ describe("a rate-limited failure", () => {
 	});
 });
 
+describe("provider diagnostic resolution", () => {
+	for (const terminal of [
+		{ subtype: "success", is_error: true },
+		{ subtype: "success", is_error: true, result: "" },
+		{ subtype: "success", is_error: true, result: "   " },
+		{ subtype: "error_during_execution", errors: [] },
+		{ subtype: "error_during_execution", errors: ["", "  "] },
+		{ subtype: "error_during_execution", error: "" },
+	]) {
+		it(`retains the provider diagnostic with unavailable terminal wording ${JSON.stringify(terminal)}`, async () => {
+			const c = makeCtx();
+			await consume(c, [syntheticReport, { type: "result", ...terminal }]);
+			assert.equal(c.turnOutput.errorMessage, diagnostic);
+			assert.deepEqual(c.turnOutput.content, []);
+		});
+	}
+
+	it("keeps meaningful terminal wording primary and distinct reset information", async () => {
+		const c = makeCtx();
+		await consume(c, [syntheticReport, errorResult]);
+		assert.equal(c.turnOutput.errorMessage, `${errorResult.result}\n${diagnostic}`);
+	});
+
+	it("prepares a thrown quota failure without swallowing or replacing the exception", async () => {
+		const c = makeCtx();
+		const thrown = new Error("SDK subprocess stopped");
+		async function* messages() {
+			yield { type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: 1786141800 } };
+			yield syntheticReport;
+			throw thrown;
+		}
+		await assert.rejects(__test.consumeQuery(messages(), toolMap, fakeModel, () => false, c), (e) => e === thrown);
+		const stream = c.currentPiStream;
+		__test.finalizeCurrentStream(c, c.turnOutput.stopReason);
+		const failed = stream.events.at(-2);
+		assert.equal(failed.type, "error");
+		assert.deepEqual(failed.error.content, []);
+		assert.match(failed.error.errorMessage, /^Claude quota exceeded — rate limit \(five_hour\).*SDK subprocess stopped\n/s);
+		assert.ok(failed.error.errorMessage.endsWith(diagnostic));
+		assert.equal(c.rateLimitRejection, null);
+	});
+
+	it("uses the synthetic diagnostic for an empty thrown error", async () => {
+		const c = makeCtx();
+		async function* messages() { yield syntheticReport; throw new Error(""); }
+		await assert.rejects(__test.consumeQuery(messages(), toolMap, fakeModel, () => false, c));
+		assert.equal(c.turnOutput.errorMessage, diagnostic);
+		assert.equal(c.turnOutput.stopReason, "error");
+	});
+
+	it("does not carry a synthetic diagnostic across turn reset or genuine success", async () => {
+		const c = makeCtx();
+		await consume(c, [syntheticReport]);
+		c.resetTurnState(fakeModel);
+		await consume(c, [errorResult]);
+		assert.equal(c.turnOutput.errorMessage, errorResult.result);
+		c.resetTurnState(fakeModel);
+		await consume(c, [syntheticReport, { type: "result", subtype: "success", is_error: false, result: "Recovered" }]);
+		assert.deepEqual(c.turnOutput.content, [{ type: "text", text: "Recovered" }]);
+		assert.equal(c.turnOutput.errorMessage, undefined);
+		await consume(c, [errorResult]);
+		assert.equal(c.turnOutput.errorMessage, errorResult.result);
+	});
+});
+
+describe("failure replay-safety boundaries", () => {
+	it("retains completed streamed output before a synthetic quota failure", async () => {
+		const c = makeCtx();
+		await consume(c, [
+			{ type: "stream_event", event: { type: "message_start", message: { id: "real" } } },
+			{ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+			{ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Real answer" } } },
+			{ type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+			{ type: "stream_event", event: { type: "message_stop" } },
+			{ type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "five_hour" } },
+			syntheticReport,
+			{ type: "result", subtype: "success", is_error: true, result: "" },
+		]);
+		const stream = c.currentPiStream;
+		__test.finalizeCurrentStream(c, c.turnOutput.stopReason);
+		assert.deepEqual(c.turnOutput.content.filter((block) => block.type === "text").map((block) => block.text), ["Real answer"]);
+		assert.deepEqual(stream.events.filter((e) => e.type === "text_delta").map((e) => e.delta), ["Real answer"]);
+		assert.match(c.turnOutput.errorMessage, /^Claude quota exceeded — rate limit \(five_hour\):/);
+		assert.ok(c.turnOutput.errorMessage.endsWith(diagnostic));
+	});
+
+	it("does not rewrite a dispatched tool call after its stream has closed", async () => {
+		const c = makeCtx();
+		const stream = c.currentPiStream;
+		await consume(c, [{
+			type: "assistant", message: { model: "claude", content: [
+				{ type: "text", text: "Running command" },
+				{ type: "tool_use", name: "mcp__custom-tools__bash", id: "toolu_real", input: { command: "pwd" } },
+			] },
+		}]);
+		const recorded = structuredClone(stream.events.at(-2));
+		assert.equal(recorded.reason, "toolUse");
+		assert.deepEqual(recorded.message.content.map((block) => block.type), ["text", "toolCall"]);
+		await consume(c, [syntheticReport, errorResult]);
+		assert.deepEqual(stream.events.at(-2), recorded);
+		assert.equal(c.turnOutput.stopReason, "toolUse");
+		assert.deepEqual(c.turnToolCallIds, ["toolu_real"]);
+	});
+});
+
 describe("error results", () => {
 	it("marks the turn errored and finalizes with an error event", async () => {
 		const c = makeCtx();
@@ -124,23 +234,7 @@ describe("error results", () => {
 		assert.strictEqual(terminal.error.errorMessage, errorResult.result);
 	});
 
-	it("does not re-emit text the synthetic assistant message already delivered", async () => {
-		const c = makeCtx();
-		await consume(c, [
-			{ type: "assistant", message: { model: "<synthetic>", content: [{ type: "text", text: errorResult.result }] } },
-			errorResult,
-		]);
-
-		const texts = c.turnOutput.content.filter((b) => b.type === "text");
-		assert.deepStrictEqual(texts.map((b) => b.text), [errorResult.result]);
-	});
-
-	// A consumer that fails over only before output commits, such as
-	// pi-model-fallback-alias, cannot reach the next provider if Claude Code's own
-	// failure report counts as output. Such a consumer commits on anything that is
-	// not a start or thinking event, so only that prefix may precede the terminal
-	// error.
-	it("keeps a synthetic report off the stream, so failover is still possible", async () => {
+	it("reports a synthetic failure only as error metadata, without committing assistant output", async () => {
 		const c = makeCtx();
 		await consume(c, [
 			{ type: "assistant", message: { model: "<synthetic>", content: [{ type: "text", text: errorResult.result }] } },
@@ -157,8 +251,7 @@ describe("error results", () => {
 		);
 		assert.strictEqual(stream.events.at(-2).type, "error");
 		assert.strictEqual(stream.events.at(-2).error.errorMessage, errorResult.result);
-		// The wording still reaches pi's transcript as the failed turn's content.
-		assert.deepStrictEqual(c.turnOutput.content, [{ type: "text", text: errorResult.result }]);
+		assert.deepStrictEqual(stream.events.at(-2).error.content, []);
 	});
 
 	// A stalled stream whose non-streaming retry also fails: the synthetic failure
@@ -182,7 +275,8 @@ describe("error results", () => {
 			errorResult,
 		]);
 
-		assert.deepStrictEqual(c.turnOutput.content, [{ type: "text", text: errorResult.result }]);
+		assert.deepStrictEqual(c.turnOutput.content, []);
+		assert.strictEqual(c.turnOutput.errorMessage, errorResult.result);
 		assert.strictEqual(c.turnSawToolCall, false);
 		assert.strictEqual(c.turnStreamOpen, false);
 	});

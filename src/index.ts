@@ -518,12 +518,29 @@ function extractIsolatedSummaryPrompt(messages: Context["messages"]): string {
 /** Failure text for an SDK result, or undefined when it succeeded. CC reports API failures
  *  (429 capacity, overload, prompt-too-long) with `is_error` on an otherwise success-shaped
  *  result; the dedicated error subtypes carry `errors` instead. */
-function resultErrorText(message: SDKMessage): string | undefined {
+function resultErrorText(message: SDKMessage, syntheticDiagnostic?: string): string | undefined {
 	const result = message as SDKMessage & { subtype?: string; is_error?: boolean; result?: string; errors?: unknown; error?: unknown };
-	if (result.subtype === "success") return result.is_error ? result.result || "Claude Code reported an error" : undefined;
-	if (Array.isArray(result.errors) && result.errors.length) return result.errors.map(String).join("\n");
-	if (typeof result.error === "string") return result.error;
-	return `Claude Code failed: ${result.subtype ?? "unknown result"}`;
+	if (result.subtype === "success") {
+		return result.is_error ? failureDiagnostic(result.result, syntheticDiagnostic) : undefined;
+	}
+	const errors = Array.isArray(result.errors) ? result.errors.map(String).filter((text) => text.trim()).join("\n") : undefined;
+	const terminal = errors || (typeof result.error === "string" ? result.error : undefined);
+	return failureDiagnostic(terminal, syntheticDiagnostic, `Claude Code failed: ${result.subtype ?? "unknown result"}`);
+}
+
+/** Terminal wording leads; distinct provider detail (notably reset times) survives. */
+function failureDiagnostic(terminal: string | undefined, synthetic: string | undefined, fallback = "Claude Code reported an error"): string {
+	if (!terminal?.trim()) return synthetic || fallback;
+	if (!synthetic || terminal.includes(synthetic)) return terminal;
+	return `${terminal}\n${synthetic}`;
+}
+
+/** Consume the rejection once, for either an SDK result or a thrown failure. */
+function labelQueryFailure(c: QueryContext, diagnostic: string): string {
+	if (!c.rateLimitRejection) return diagnostic;
+	const rejection = c.rateLimitRejection;
+	c.rateLimitRejection = null;
+	return describeRateLimitFailure(rejection, diagnostic);
 }
 
 /** Name a failure as a rate limit when a rejection preceded it.
@@ -1409,22 +1426,19 @@ function dropAbandonedStreamBlocks(c: QueryContext, why: string): void {
 function processAssistantMessage(message: SDKMessage, model: Model<any>, customToolNameToPi: Map<string, string>, c: QueryContext): void {
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
-	// Claude Code reports API failures and its own quota/context notices as a
-	// `<synthetic>` assistant message: a report, not model output. Streaming its text
-	// pins the turn's output before the failure it describes, and a consumer that only
-	// fails over before output commits (pi-model-fallback-alias) then cannot reach the
-	// next provider. Keep the wording on the failed turn — the error event carries it —
-	// but emit no events, so the turn still reads as a call that produced no output.
-	// Issue #162.
+	// Claude Code's failure notices are diagnostics, not generated output. Even
+	// terminal content can commit output in host consumers, without text deltas.
 	if (assistantMsg.model === "<synthetic>") {
 		// The report can follow a stalled stream whose non-streaming retry also failed;
 		// drop the abandoned partial blocks (unsigned thinking, a tool call CC will never
 		// dispatch) the way the fallback path below would.
 		if (c.turnSawStreamEvent && c.turnStreamOpen) dropAbandonedStreamBlocks(c, "synthetic failure report");
-		debug(`processAssistantMessage: <synthetic> message, keeping ${assistantMsg.content.length} block(s) off the stream`);
+		debug(`processAssistantMessage: <synthetic> message, retaining diagnostic only`);
 		for (const block of assistantMsg.content) {
-			if (block.type === "text" && block.text) c.turnBlocks.push({ type: "text", text: block.text });
-			else debug("processAssistantMessage: unhandled <synthetic> block type", block.type);
+			if (block.type === "text" && block.text?.trim()) {
+				c.turnSyntheticDiagnostic = c.turnSyntheticDiagnostic
+					? `${c.turnSyntheticDiagnostic}\n${block.text}` : block.text;
+			} else debug("processAssistantMessage: unhandled <synthetic> block type", block.type);
 		}
 		if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model);
 		return;
@@ -1504,132 +1518,146 @@ async function consumeQuery(
 	let capturedSessionId: string | undefined;
 	let failure: Error | undefined;
 
-	for await (const message of sdkQuery) {
-		// CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery
-		// sees, one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to
-		// capture replay fixtures, so unit tests assert against message shapes Claude
-		// Code really emitted rather than ones we imagined.
-		const recordStreamPath = process.env.CLAUDE_BRIDGE_RECORD_STREAM;
-		if (recordStreamPath) appendFileSync(recordStreamPath, `${JSON.stringify(message)}\n`);
-		if (wasAborted()) break;
-		await reportHeldRateLimit(queryCtx, model);
-		// Everything below the currentPiStream guard is content, which there is
-		// nowhere to put once a turn has ended on a tool call. Handle lifecycle
-		// messages before that gate:
-		//
-		// - replay acknowledgements: clear a queued steer even after its pi turn
-		//   stream has ended.
-		// - stdin: nothing else closes the CLI's stdin now that the prompt is a
-		//   streamed generator (isSingleUserTurn=false), so missing this hangs the query.
-		// - the failure a `result` carries: it is the only record that the turn
-		//   failed at all. Behind the guard, a 429 arriving at a tool boundary
-		//   logged nothing. It fails turnOutput only while the turn's stream is
-		//   open; once ended, turnOutput is the message pi already recorded.
-		// - rate-limit events: notifications to the user, which are most likely to
-		//   fire during exactly the long tool-using turns the guard was skipping.
-		if (message.type === "user" && message.parent_tool_use_id === null && "isReplay" in message && message.isReplay === true) {
-			// For fresh steer UUIDs, replay marks incorporation into the turn, not
-			// completion. Its MCP calls still need stdin until the following result.
-			queryCtx.pendingSteerUuids.delete(message.uuid);
-		}
-		let resultError: string | undefined;
-		if (message.type === "result") {
-			logServedContextWindow("result", message, model);
-			resultError = resultErrorText(message);
-			// A result ends a turn, not necessarily the query: steers not yet replayed
-			// can still start a later turn.
-			if (resultError !== undefined || queryCtx.pendingSteerUuids.size === 0) queryCtx.promptStream?.end();
-			if (resultError !== undefined) {
-				// Consume the rejection alongside the failure it caused, so a later
-				// unrelated failure on this query doesn't inherit the label.
-				if (queryCtx.rateLimitRejection) {
-					resultError = describeRateLimitFailure(queryCtx.rateLimitRejection, resultError);
-					queryCtx.rateLimitRejection = null;
-				}
-				debug(`consumeQuery: error result, subtype=${message.subtype}, error=${resultError}`);
-				if (queryCtx.turnOutput && queryCtx.currentPiStream) {
-					queryCtx.turnOutput.stopReason = "error";
-					queryCtx.turnOutput.errorMessage = resultError;
-				}
-				// The failure ends the query. Closing stdin does not: Claude Code still
-				// runs a steer it had queued, and that turn's stop reason would overwrite
-				// this one. The caller tears the query down as a failed one.
-				failure = new Error(resultError);
-				break;
-			}
-		}
-		if (message.type === "rate_limit_event") {
-			const info = (message as any).rate_limit_info;
-			debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
-			if (info) queryCtx.heldRateLimit = info;
+	try {
+		for await (const message of sdkQuery) {
+			// CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery
+			// sees, one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to
+			// capture replay fixtures, so unit tests assert against message shapes Claude
+			// Code really emitted rather than ones we imagined.
+			const recordStreamPath = process.env.CLAUDE_BRIDGE_RECORD_STREAM;
+			if (recordStreamPath) appendFileSync(recordStreamPath, `${JSON.stringify(message)}\n`);
+			if (wasAborted()) break;
 			await reportHeldRateLimit(queryCtx, model);
-			if (info?.status === "rejected") {
-				// Held so the failure Claude Code sends next can be named as a rate limit.
-				queryCtx.rateLimitRejection = info;
-				// The "rate limit reached" notice below supersedes warnings; re-arm so the next
-				// window's warnings fire even if it opens straight into allowed_warning.
-				queryCtx.lastRateLimitWarnStep = null;
-				queryCtx.lastRateLimitWarnThreshold = undefined;
-				// resetsAt is Unix seconds, not milliseconds.
-				const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
-				piUI?.notify(`Claude subscription rate limit reached (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
-			} else if (info?.status === "allowed") {
-				// Back under the threshold (window reset) — re-arm the warning dedupe.
-				queryCtx.lastRateLimitWarnStep = null;
-				queryCtx.lastRateLimitWarnThreshold = undefined;
-			} else if (info?.status === "allowed_warning") {
-				// utilization is a fraction (0..1); allowed_warning fires once it crosses surpassedThreshold.
-				const percent = Math.round((info.utilization ?? 0) * 100);
-				// The SDK emits one event per request, so only re-notify when the level
-				// rises past a new 5% step or the threshold changes.
-				const step = Math.floor(percent / 5);
-				const rose = queryCtx.lastRateLimitWarnStep === null || step > queryCtx.lastRateLimitWarnStep;
-				if (rose || info.surpassedThreshold !== queryCtx.lastRateLimitWarnThreshold) {
-					queryCtx.lastRateLimitWarnStep = step;
-					queryCtx.lastRateLimitWarnThreshold = info.surpassedThreshold;
-					piUI?.notify(`Claude rate limit warning: ${percent}% used (${info.rateLimitType ?? ""})`, "warning");
-				}
+			// Everything below the currentPiStream guard is content, which there is
+			// nowhere to put once a turn has ended on a tool call. Handle lifecycle
+			// messages before that gate:
+			//
+			// - replay acknowledgements: clear a queued steer even after its pi turn
+			//   stream has ended.
+			// - stdin: nothing else closes the CLI's stdin now that the prompt is a
+			//   streamed generator (isSingleUserTurn=false), so missing this hangs the query.
+			// - the failure a `result` carries: it is the only record that the turn
+			//   failed at all. Behind the guard, a 429 arriving at a tool boundary
+			//   logged nothing. It fails turnOutput only while the turn's stream is
+			//   open; once ended, turnOutput is the message pi already recorded.
+			// - rate-limit events: notifications to the user, which are most likely to
+			//   fire during exactly the long tool-using turns the guard was skipping.
+			if (message.type === "user" && message.parent_tool_use_id === null && "isReplay" in message && message.isReplay === true) {
+				// For fresh steer UUIDs, replay marks incorporation into the turn, not
+				// completion. Its MCP calls still need stdin until the following result.
+				queryCtx.pendingSteerUuids.delete(message.uuid);
 			}
-			continue;
-		}
-		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
+			let resultError: string | undefined;
+			if (message.type === "result") {
+				logServedContextWindow("result", message, model);
+				resultError = resultErrorText(message, queryCtx.turnSyntheticDiagnostic);
+				// A result ends a turn, not necessarily the query: steers not yet replayed
+				// can still start a later turn.
+				if (resultError !== undefined || queryCtx.pendingSteerUuids.size === 0) queryCtx.promptStream?.end();
+				if (resultError !== undefined) {
+					resultError = labelQueryFailure(queryCtx, resultError);
+					debug(`consumeQuery: error result, subtype=${message.subtype}, error=${resultError}`);
+					if (queryCtx.turnOutput && queryCtx.currentPiStream) {
+						queryCtx.turnOutput.stopReason = "error";
+						queryCtx.turnOutput.errorMessage = resultError;
+					}
+					// The failure ends the query. Closing stdin does not: Claude Code still
+					// runs a steer it had queued, and that turn's stop reason would overwrite
+					// this one. The caller tears the query down as a failed one.
+					failure = new Error(resultError);
+					break;
+				}
+				// A successful result resolves any earlier notice; it must not label a
+				// later failure on a steered turn of this query.
+				queryCtx.turnSyntheticDiagnostic = undefined;
+				queryCtx.rateLimitRejection = null;
+			}
+			if (message.type === "rate_limit_event") {
+				const info = (message as any).rate_limit_info;
+				debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
+				if (info) queryCtx.heldRateLimit = info;
+				await reportHeldRateLimit(queryCtx, model);
+				if (info?.status === "rejected") {
+					// Held so the failure Claude Code sends next can be named as a rate limit.
+					queryCtx.rateLimitRejection = info;
+					// The "rate limit reached" notice below supersedes warnings; re-arm so the next
+					// window's warnings fire even if it opens straight into allowed_warning.
+					queryCtx.lastRateLimitWarnStep = null;
+					queryCtx.lastRateLimitWarnThreshold = undefined;
+					// resetsAt is Unix seconds, not milliseconds.
+					const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
+					piUI?.notify(`Claude subscription rate limit reached (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
+				} else if (info?.status === "allowed") {
+					// Back under the threshold (window reset) — re-arm the warning dedupe.
+					queryCtx.lastRateLimitWarnStep = null;
+					queryCtx.lastRateLimitWarnThreshold = undefined;
+				} else if (info?.status === "allowed_warning") {
+					// utilization is a fraction (0..1); allowed_warning fires once it crosses surpassedThreshold.
+					const percent = Math.round((info.utilization ?? 0) * 100);
+					// The SDK emits one event per request, so only re-notify when the level
+					// rises past a new 5% step or the threshold changes.
+					const step = Math.floor(percent / 5);
+					const rose = queryCtx.lastRateLimitWarnStep === null || step > queryCtx.lastRateLimitWarnStep;
+					if (rose || info.surpassedThreshold !== queryCtx.lastRateLimitWarnThreshold) {
+						queryCtx.lastRateLimitWarnStep = step;
+						queryCtx.lastRateLimitWarnThreshold = info.surpassedThreshold;
+						piUI?.notify(`Claude rate limit warning: ${percent}% used (${info.rateLimitType ?? ""})`, "warning");
+					}
+				}
+				continue;
+			}
+			if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
 
-		switch (message.type) {
-			case "stream_event":
-				processStreamEvent(message, customToolNameToPi, model, queryCtx);
-				break;
-			case "assistant":
-				processAssistantMessage(message, model, customToolNameToPi, queryCtx);
-				break;
-			case "result": {
-					// The failure itself was recorded above the guard, along with the served
-					// context window. What is left here is the success path: push the result
-					// text when no assistant message already delivered it.
-					if (resultError === undefined && !queryCtx.turnSawStreamEvent && message.subtype === "success") {
-					ensureTurnStarted(queryCtx);
-					const text = message.result || "";
-					queryCtx.turnBlocks.push({ type: "text", text });
-					const idx = queryCtx.turnBlocks.length - 1;
-					queryCtx.currentPiStream?.push({ type: "text_start", contentIndex: idx, partial: queryCtx.turnOutput });
-					queryCtx.currentPiStream?.push({ type: "text_delta", contentIndex: idx, delta: text, partial: queryCtx.turnOutput });
-					queryCtx.currentPiStream?.push({ type: "text_end", contentIndex: idx, content: text, partial: queryCtx.turnOutput });
+			switch (message.type) {
+				case "stream_event":
+					processStreamEvent(message, customToolNameToPi, model, queryCtx);
+					break;
+				case "assistant":
+					processAssistantMessage(message, model, customToolNameToPi, queryCtx);
+					break;
+				case "result": {
+						// The failure itself was recorded above the guard, along with the served
+						// context window. What is left here is the success path: push the result
+						// text when no assistant message already delivered it.
+						if (resultError === undefined && !queryCtx.turnSawStreamEvent && message.subtype === "success") {
+						ensureTurnStarted(queryCtx);
+						const text = message.result || "";
+						queryCtx.turnBlocks.push({ type: "text", text });
+						const idx = queryCtx.turnBlocks.length - 1;
+						queryCtx.currentPiStream?.push({ type: "text_start", contentIndex: idx, partial: queryCtx.turnOutput });
+						queryCtx.currentPiStream?.push({ type: "text_delta", contentIndex: idx, delta: text, partial: queryCtx.turnOutput });
+						queryCtx.currentPiStream?.push({ type: "text_end", contentIndex: idx, content: text, partial: queryCtx.turnOutput });
+					}
+					break;
 				}
-				break;
+				case "system":
+					if ((message as any).subtype === "init" && (message as any).session_id) {
+						capturedSessionId = (message as any).session_id;
+					}
+					break;
+				case "user":
+					// Prompt/tool-result echoes have no content events to emit. With
+					// replay-user-messages, queued steers also arrive as user replays;
+					// their lifecycle acknowledgement is handled above the stream guard.
+					break;
+				default:
+					debug("consumeQuery: unhandled SDK message type", message.type);
+					break;
 			}
-			case "system":
-				if ((message as any).subtype === "init" && (message as any).session_id) {
-					capturedSessionId = (message as any).session_id;
-				}
-				break;
-			case "user":
-				// Prompt/tool-result echoes have no content events to emit. With
-				// replay-user-messages, queued steers also arrive as user replays;
-				// their lifecycle acknowledgement is handled above the stream guard.
-				break;
-			default:
-				debug("consumeQuery: unhandled SDK message type", message.type);
-				break;
 		}
+	} catch (error) {
+		// A replacement can already own this context while the discarded SDK
+		// iterator unwinds. Do not read or consume the replacement's diagnostics.
+		if (abandonedQueries.has(sdkQuery)) throw error;
+		// Prepare the same public error contract for SDK generator throws. Leave
+		// teardown and exception identity to the existing outer catch.
+		const terminal = error instanceof Error ? error.message : String(error);
+		const diagnostic = labelQueryFailure(queryCtx, failureDiagnostic(terminal, queryCtx.turnSyntheticDiagnostic));
+		if (queryCtx.turnOutput && queryCtx.currentPiStream && !wasAborted()) {
+			queryCtx.turnOutput.stopReason = "error";
+			queryCtx.turnOutput.errorMessage ??= diagnostic;
+		}
+		throw error;
 	}
 
 	// DEBUG: trace when consumeQuery exits
