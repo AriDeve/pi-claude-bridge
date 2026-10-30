@@ -145,6 +145,12 @@ Requires the following in `~/.pi/agent/subagents.json`:
 {"promptInheritance": {"claude-bridge": "portable"}}
 ```
 
+### Same-process subagents and provider lifecycle
+
+Every bridge activation registers through the host's provider API, including children whose startup rebuilds extension registrations (OMP). Registrations reuse the original serving function so parent tool results still reach their parked Claude Code query, even when a child has a separate model registry. Session shutdown and explicit new/resume/fork transitions clear only that runtime's session mirrors and rewrite marks; child disposal does not release the parent's serving ownership. Owner shutdown/reload releases ownership for fresh activation.
+
+The registration's `not-used` API key is only a host placeholder. Claude Code/SDK still owns credential acquisition and refresh; the bridge does not copy or refresh Claude credentials.
+
 ## Known issues
 
 **A session rebuild re-sends the whole conversation.** The bridge rewrites Claude Code's session from pi's history whenever the two diverge — after an abort, `/compact`, tree navigation, an API error, or on returning to a session — and the next request usually misses the prompt cache for everything past the system prompt. Abort-heavy sessions cost noticeably more.

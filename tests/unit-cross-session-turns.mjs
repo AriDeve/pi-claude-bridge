@@ -37,12 +37,25 @@ const { setQuery, getSharedSession, resetSharedSession } = __test;
 // module's default export with stub registration hooks, keep the real
 // streamSimple that lands in the provider config.
 const mod = await import("../src/index.js");
-let providerConfig;
-mod.default({
-	on: () => {},
-	registerProvider: (_name, config) => { providerConfig = config; },
-	registerTool: () => {},
-});
+function activateHost(factory) {
+	const handlers = new Map();
+	let selected;
+	factory({
+		on(event, fn) { const list = handlers.get(event) ?? []; list.push(fn); handlers.set(event, list); },
+		registerProvider(_name, config) { selected = config; },
+		registerTool() {},
+	});
+	return {
+		get selected() { return selected; },
+		emit(event, id, reason) {
+			for (const fn of handlers.get(event) ?? []) fn({ reason }, {
+				cwd: process.cwd(), sessionManager: { getSessionId: () => id },
+			});
+		},
+	};
+}
+const parentHost = activateHost(mod.default);
+const providerConfig = parentHost.selected;
 const streamSimple = providerConfig.streamSimple;
 // A real registered model object, not a bare {id}: pi-ai's calculateCost reads
 // the pricing tiers off it for every usage update.
@@ -103,6 +116,57 @@ afterEach(() => {
 });
 
 describe("cross-session conversation isolation", () => {
+	for (const loading of ["fresh", "prepared"]) {
+		it(`${loading} overlapping child lifecycles preserve parked delivery and next-turn resume`, { timeout: 5000 }, async () => {
+			const P = `parent-${loading}`, C = `child-${loading}`;
+			parentHost.emit("session_start", P);
+			const u1 = user("first"), a1 = say("first answer"), u2 = user("use tool");
+			const tools = [{ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } } } }];
+			const parentCall = (messages) => streamSimple(model, { messages, tools }, { sessionId: P });
+			scripts.push({ label: "seed parent", steps: [init(`cc-${P}`), result("first answer")] });
+			await parentCall([u1]).result();
+			const delivered = gate();
+			scripts.push({ label: "park parent", steps: [init("ignored"), ...toolUse(`tool-${P}`), delivered.wait, result("parent answer")] });
+			const parked = await parentCall([u1, a1, u2]).result();
+			assert.equal(parked.stopReason, "toolUse");
+			const query = [...__test.activeQueryContexts].find((c) => c.piSessionId === P);
+			let received;
+			query.pendingToolCalls.set(`tool-${P}`, {
+				toolName: "read", resolve(value) { received = value; delivered.open(); },
+			});
+
+			const factory = loading === "prepared" ? mod.default : (await import(`../src/index.js?continuity-${loading}`)).default;
+			const childHost = activateHost(factory);
+			childHost.emit("session_start", C);
+			// The selected entry is the registration replayed after source clearing,
+			// not a saved direct call to the parent's function.
+			let selected = childHost.selected;
+			const selectedCall = (id, messages) => selected.streamSimple(selected.models[0], { messages, tools }, { sessionId: id });
+			scripts.push({ label: "child", steps: [init(`cc-${C}`), result("child answer")] });
+			await selectedCall(C, [user("child task")]).result();
+			assert.equal(getSharedSession(C).sessionId, `cc-${C}`);
+			const overlappingHost = activateHost(factory);
+			overlappingHost.emit("session_start", `${C}-overlap`);
+			selected = overlappingHost.selected;
+			scripts.push({ label: "overlapping child", steps: [init(`cc-${C}-overlap`), result("overlap answer")] });
+			await overlappingHost.selected.streamSimple(model, { messages: [user("overlap task")], tools }, { sessionId: `${C}-overlap` }).result();
+			overlappingHost.emit("session_shutdown", `${C}-overlap`);
+			childHost.emit("session_shutdown", C);
+			childHost.emit("session_shutdown", C);
+			assert.equal(getSharedSession(C), null, "child mirror is released in the serving module");
+			assert.equal(getSharedSession(P).sessionId, `cc-${P}`);
+
+			const history = [u1, a1, u2, toolCall(`tool-${P}`), toolResult(`tool-${P}`)];
+			const completion = await selectedCall(P, history).result();
+			assert.equal(completion.stopReason, "stop");
+			assert.equal(received.content[0].text, "file", "result reaches the original parked SDK query");
+			assert.equal(calls.length, 4, "tool delivery must not start a replacement query");
+			scripts.push({ label: "parent next", steps: [init("wrong-new-conversation"), result("ok")] });
+			await selectedCall(P, [...history, say("parent answer"), user("next")]).result();
+			assert.equal(calls.at(-1).resume, `cc-${P}`);
+		});
+	}
+
 	it("a foreground child in the parent's first turn cannot claim the parent's conversation", async () => {
 		const P = "pi-parent", C = "pi-child";
 		const u1 = user("research X"), a1 = toolCall("toolu_P1"), tr1 = toolResult("toolu_P1"), a2 = say("parent answer"), u2 = user("now fix it");
@@ -236,5 +300,29 @@ describe("cross-session conversation isolation", () => {
 
 		assert.equal(calls.at(-1).resume, "cc-P",
 			"the parent resumes its own conversation after a child ran while it backed off");
+	});
+
+	it("owner shutdown allows a fresh module to serve a new conversation", async () => {
+		parentHost.emit("session_shutdown", "pi-parent");
+		const replacement = await import("../src/index.js?owner-reloaded");
+		const reloadedHost = activateHost(replacement.default);
+		reloadedHost.emit("session_start", "reloaded");
+		let resumed;
+		replacement.__test.setQuery(({ options }) => {
+			resumed = options.resume;
+			const gen = (async function* () { yield init("cc-reloaded"); yield result("new owner answer"); })();
+			gen.interrupt = async () => {};
+			gen.close = () => {};
+			return gen;
+		});
+		try {
+			await reloadedHost.selected.streamSimple(reloadedHost.selected.models[0], { messages: [user("new owner")], tools: [] }, { sessionId: "reloaded" }).result();
+			assert.equal(resumed, undefined);
+			assert.equal(replacement.__test.getSharedSession("reloaded").sessionId, "cc-reloaded");
+			assert.notEqual(reloadedHost.selected.streamSimple, streamSimple);
+		} finally {
+			replacement.__test.setQuery(null);
+			reloadedHost.emit("session_shutdown", "reloaded");
+		}
 	});
 });

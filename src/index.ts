@@ -129,6 +129,17 @@ function diagDump(label: string, data: Record<string, unknown>) {
 // Full registration policy (first vs later instances, shared vs own registry):
 // see the "--- Provider ---" block in activate() below.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
+const SESSION_CLEANUP_KEY = Symbol.for("claude-bridge:sessionCleanup");
+
+type ServingGlobals = {
+	[ACTIVE_STREAM_SIMPLE_KEY]?: typeof streamClaudeAgentSdk;
+	[SESSION_CLEANUP_KEY]?: (sessionId: string) => void;
+};
+
+function clearSessionState(sessionId: string): void {
+	sharedSessions.delete(sessionKey(sessionId));
+	historyRewrittenBySession.delete(sessionId);
+}
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
@@ -2488,31 +2499,27 @@ export default function (pi: ExtensionAPI) {
 		pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
 	}
 
-	// Reset shared session on pi session lifecycle events
-	const clearSession = (event: string) => {
-		debug(`${event}: clearing ${sharedSessions.size} shared session${sharedSessions.size === 1 ? "" : "s"}`);
-		// Whole map: children never emit session_shutdown (only runtime teardown
-		// and /reload do), so there is no per-entry removal to do here — the
-		// top-level transition takes every mirror with it.
-		sharedSessions.clear();
-		historyRewrittenBySession.clear();
-
-		// Clear the global streamSimple if this instance registered it.
-		// This allows /reload to work — the old instance clears the flag so
-		// the new instance can register fresh without wrapping stale state.
-		const g = globalThis as Record<symbol, any>;
-		if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
-			debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
-			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
-		}
-	};
+	// Each factory invocation is one extension runtime, even when a prepared
+	// factory reuses this module. Only the activating owner may release serving
+	// ownership; every runtime cleans its own session in the serving module.
+	const servingGlobals = globalThis as ServingGlobals;
+	const ownsServingState = !servingGlobals[ACTIVE_STREAM_SIMPLE_KEY];
+	let lifecycleSessionId: string | undefined;
+	const clearSession = servingGlobals[SESSION_CLEANUP_KEY] ?? clearSessionState;
+	let shutdown = false;
 	pi.on("session_start", (event, ctx) => {
 		piUI = ctx.ui;
 		piMode = ctx.mode;
-		rememberSessionCwd(ctx.sessionManager.getSessionId(), ctx.cwd);
+		const sessionId = ctx.sessionManager.getSessionId();
+		rememberSessionCwd(sessionId, ctx.cwd);
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
-			clearSession(`session_start:${event.reason}`);
+			if (lifecycleSessionId && lifecycleSessionId !== sessionId) {
+				clearSession(lifecycleSessionId);
+				forgetSessionCwd(lifecycleSessionId);
+			}
+			clearSession(sessionId);
 		}
+		lifecycleSessionId = sessionId;
 	});
 	pi.on("session_before_compact", (event, ctx) => {
 		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
@@ -2578,9 +2585,16 @@ export default function (pi: ExtensionAPI) {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
-		forgetSessionCwd(ctx.sessionManager.getSessionId());
+		if (shutdown) return;
+		shutdown = true;
+		const sessionId = ctx.sessionManager.getSessionId();
+		forgetSessionCwd(sessionId);
 		reportLeaks("session_shutdown");
-		clearSession("session_shutdown");
+		clearSession(sessionId);
+		if (ownsServingState && servingGlobals[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
+			servingGlobals[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
+			servingGlobals[SESSION_CLEANUP_KEY] = undefined;
+		}
 	});
 
 	// Pi and summary extensions own compaction and branch summaries; native calls use the
@@ -2608,56 +2622,26 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Provider ---
 	//
-	// Registration policy across module instances (a subagent session can load
-	// this module fresh): the FIRST instance registers unconditionally at load,
-	// which is what puts claude-bridge models in the picker before any session
-	// starts. Later instances decide at session_start, when ctx.modelRegistry
-	// reveals who owns this session's registry:
-	//
-	// - Registry already has the provider (host passes the parent's registry down,
-	//   e.g. pi-subagents >=0.14.3): skip. Re-registering would overwrite the
-	//   parent's pinned streamSimple with this instance's fresh — empty-state —
-	//   stream fn, and the parent's next tool-result delivery would route into it.
-	// - Registry lacks the provider (host gives the child its own, e.g. older
-	//   pi-subagents forks): register, or every claude-bridge/* dispatch in the
-	//   child fails with "Model not found" (#91). Even loading the bridge via the
-	//   agent's `extensions:` frontmatter didn't help there — the module loaded,
-	//   hit the old skip-guard, and the child's registry stayed empty.
-	//
-	// A per-instance stream fn registered into a per-instance registry is
-	// self-consistent: that session's traffic flows through this module state,
-	// which starts clean and serves only that session.
-	//
-	// On session_shutdown (including /reload), clearSession() resets
-	// ACTIVE_STREAM_SIMPLE_KEY so a freshly loaded module can register as first
-	// again.
+	// Every activation participates in the host's source-owned registration replay.
+	// Child startup may clear registration even when it reuses the parent registry;
+	// separate registries can also share process-global API dispatch. Always replay
+	// the original serving function, whose mirrors and parked queries remain live.
 
-	const g = globalThis as Record<symbol, any>;
+	const g = servingGlobals;
+	// The host supplies TranscriptContext; stream entry normalizes it to Context.
+	const servingStream = (g[ACTIVE_STREAM_SIMPLE_KEY] ?? streamClaudeAgentSdk) as unknown as
+		NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]["streamSimple"]>;
 	const providerConfig = {
 		baseUrl: "claude-bridge",
 		apiKey: "not-used",
 		api: "claude-bridge",
 		models: registeredModels,
-		// Cast: the Provider interface passes a TranscriptContext; the bridge takes plain
-		// Context models (toBridgeContext normalizes at the stream entry points).
-		streamSimple: streamClaudeAgentSdk as any,
+		streamSimple: servingStream,
 	};
-	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
-		// First instance: store our streamSimple and register.
-		g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk;
-		pi.registerProvider(PROVIDER_ID, providerConfig);
-	} else {
-		// Later instance: register only if this session's registry lacks the provider.
-		debug(`provider: deferring registration decision to session_start (module=${moduleInstanceId})`);
-		pi.on("session_start", (_event, ctx) => {
-			if (ctx.modelRegistry.getProvider(PROVIDER_ID)) {
-				debug(`provider: registry already has ${PROVIDER_ID}, skipping registration (module=${moduleInstanceId})`);
-				return;
-			}
-			debug(`provider: registry lacks ${PROVIDER_ID}, registering (module=${moduleInstanceId})`);
-			pi.registerProvider(PROVIDER_ID, providerConfig);
-		});
-	}
+	pi.registerProvider(PROVIDER_ID, providerConfig);
+	// Publish only after successful registration; registration errors remain visible.
+	g[ACTIVE_STREAM_SIMPLE_KEY] ??= streamClaudeAgentSdk;
+	g[SESSION_CLEANUP_KEY] ??= clearSessionState;
 
 	// --- AskClaude tool ---
 
