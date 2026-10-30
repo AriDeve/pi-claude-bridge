@@ -36,3 +36,17 @@ No build step — the package ships `src` TypeScript as-is (see `files` in `pack
 ## Tests
 
 Smoke tests typically need to run outside a sandbox because they access local pi/Claude settings and auth state.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live on this repo's Epiq board. Before tracker operations, read `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles use matching Epiq tag names. Before triaging, read `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` and `docs/adr/`. Before codebase exploration, read `docs/agents/domain.md`.
